@@ -92,12 +92,12 @@ C_prev = np.ones(num_prompts, dtype=int)
     ```py
     added_cond_kwargs = {"image_embeds": current_image_embeddings}
     ```
-    - 15. 收集每个聚类簇下所有的prompts，并对每类的prompt用逗号拼接成一个字符串
+    <!-- - 15. 收集每个聚类簇下所有的prompts，并对每类的prompt用逗号拼接成一个字符串
     ```py
     for group in all_prompt_indices:
         prompt_clusters.append(prompt_tracker[group])
         prompt_cluster_flat.append(", ".join(prompt_tracker[group]))
-    ```
+    ``` -->
     - 16. 去噪
     ```py
     x_k = md.denoise(
