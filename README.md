@@ -1,85 +1,119 @@
-# Reusing Computation in Text-to-Image Diffusion for Efficient Generation of Image Sets [ICCV 2025]
-Authors: *[Dale Decatur](https://ddecatur.github.io/), [Thibault Groueix](https://imagine.enpc.fr/~groueixt/), [Yifan Wang](https://yifita.netlify.app/), [Rana Hanocka](https://people.cs.uchicago.edu/~ranahanocka/), [Vladimir G. Kim](http://vovakim.com/), [Matheus Gadelha](http://mgadelha.me/)*
+- 1. 遍历每个prompt，调用KandinskyV22PriorPipeline模型得到其有条件的正向嵌入和无条件的负向嵌入，并堆叠起来（[2, prompt数量, 嵌入维度]）
+```py
+for prompt in tqdm(prompts):
+    image_embeddings.append(compute_prior(md, prompt))
+del md.prior_pipe
 
-\[[Paper](http://arxiv.org/abs/2508.21032)\] \[[Project Page](https://ddecatur.github.io/hierarchical-diffusion/)\]
+_ = md.prior_pipe(prompt).to_tuple()[0]
+```
+- 2. 提取所有正向嵌入的向量集合，并计算他们两两之间的余弦距离矩阵
+```py
+distance_matrix = pdist(image_embeddings[0].cpu().numpy(), metric="cosine")
+```
+- 3. 调用linkage函数进行hierarchical clustering，使用ward聚类方法，返回一个linkage matrix，每一行表示一次聚类操作，包含被合并的两个簇的索引、合并后的距离、以及新簇的样本数
+```py
+Z = sch.linkage(distance_matrix, method='ward', metric='cosine')
+```
+举例：
+假设有4个prompt，嵌入维度为128，则
+输入shape: (4, 128)
+距离矩阵shape: (6,)，分别是(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)这6对的距离
+连接矩阵shape: (3, 4)，表示3次聚类操作，eg: 
+```py
+array([
+    [0, 1, 0.12, 2],  # 第一次合并，点0和点1，距离0.12，合并后有2个点
+    [2, 3, 0.20, 2],  # 第二次合并，点2和点3，距离0.20，合并后有2个点
+    [4, 5, 0.35, 4]   # 第三次合并，前两个新簇（索引4和5），距离0.35，合并后有4个点
+    ])
+```
+- 4. 计算threshold intervals
+生成从0到cfg.tau的等间距数组，一共cfg.inference_steps个点，从大到小排列，用于控制聚类的分裂或合并
+```py
+phi = np.linspace(0, cfg.tau, cfg.inference_steps)[::-1]
+```
+- 5. 调用AutoPipelineForText2Image.decoder_pipe.prepare_latents()以随机噪声初始化latents，形状为(1, num_channels_latents, height, width)
+```py
+x_k = md.pipe.decoder_pipe.prepare_latents(
+    (1, num_channels_latents, height, width),
+    image_embeddings[0].dtype,
+    md.device,
+    None,
+    None,
+    md.scheduler,
+)
+```
+- 6. 初始化上一轮聚类的标签，每个prompt初始都属于自己的独立簇（初始化为1）
+```py
+C_prev = np.ones(num_prompts, dtype=int)
+```
+- 7. 开始循环去噪
+    - 8. 对于当前步的threshold phi_k，调用fcluster根据linkage matrix Z对prompt进行聚类，得到当前步的标签labels_k
+    ```py
+    labels_k = sch.fcluster(Z, phi_k, criterion='distance')
+    ```
+    举例：
+    ```py
+    array([
+        [0, 1, 0.12, 2],  # 第一次合并，点0和点1，距离0.12
+        [2, 3, 0.20, 2],  # 第二次合并，点2和点3，距离0.20
+        [4, 5, 0.35, 4]   # 第三次合并，前两个新簇，距离0.35
+    ])
+    ```
+    phi_k = 0.1时，阈值比所有合并距离都小，则每个点都属于自己的簇，labels_k = [1, 2, 3, 4]；phi_k = 0.15时，阈值大于第一次合并（0.12），小于第二次（0.20），点0和点1被合并为一类，点2为一类，点3为一类，labels_k = [1, 1, 2, 3]；phi_k = 0.25时，阈值大于前两次合并（0.12, 0.20），小于最后一次（0.35），点0和点1一类，点2和点3一类，labels_k = [1, 1, 2, 2]；phi_k = 0.4，阈值大于所有合并距离，所有点都被合并为一类，labels_k = [1, 1, 1, 1]
+    - 9. C_k为当前步所有簇的聚类标签号，first_index为每个聚类标签第一次出现的位置索引，inv为每个prompt属于哪个聚类标签的逆索引，counts为每个聚类标签下成员的数量
+    ```py
+    C_k, first_index, inv, counts = np.unique(labels_k, return_inverse=True, return_index=True, return_counts=True)
+    ```
+    - 10. 取出每个当前簇的第一个成员在上一轮属于哪个簇，建立当前簇到父簇的映射parent_map，追踪每个新簇是由上一轮的哪个父簇分裂出来的，然后更新C_prev
+    ```py
+    parent_map = dict(zip(C_k, C_prev[first_index]))
+    ```
+    - 11. 用父簇索引，从上一轮的latent x_k中复制出每个当前簇的初始潜变量latent
+    ```py
+    C_parent = np.array([parent_map[c] for c in C_k]) - 1
+    x_k = x_k[C_parent]
+    ```
+    - 12. 对每个聚类，计算其成员的嵌入均值，得到每个簇的代表性嵌入
+    ```py
+    y_hat = compute_mean_embeddings(
+        embeddings=image_embeddings,
+        inv=inv_t,
+        counts=counts_t
+    )
+    ```
+    - 13. 对每个聚类标签c_idx，记录所有属于该簇的prompt索引
+    ```py
+    all_prompt_indices = []
+    for c_idx in C_k:
+        prompt_indices = np.where(inv == c_idx-1)[0]
+        all_prompt_indices.append(prompt_indices)
+    ```
+    - 14. 把当前聚类的均值嵌入作为条件，传递给扩散模型的去噪过程
+    ```py
+    added_cond_kwargs = {"image_embeds": current_image_embeddings}
+    ```
+    <!-- - 15. 收集每个聚类簇下所有的prompts，并对每类的prompt用逗号拼接成一个字符串
+    ```py
+    for group in all_prompt_indices:
+        prompt_clusters.append(prompt_tracker[group])
+        prompt_cluster_flat.append(", ".join(prompt_tracker[group]))
+    ``` -->
+    - 16. 去噪
+    ```py
+    x_k = md.denoise(
+        x_k,
+        text_embeddings=None,
+        t=timesteps[k],
+        added_cond_kwargs=added_cond_kwargs,
+    )
+    ```
+- 17. 将latents解码为图像
+```py
+denoised_images = md.decode_latents(x_k)
+```
 
-![teaser](https://github.com/ddecatur/hierarchical-diffusion/raw/site/assets/tree_traversal.png)
 
-### Abstract
-Text-to-image diffusion models enable high-quality image generation but are computationally expensive. While prior work optimizes per-inference efficiency, we explore an orthogonal approach: reducing redundancy across correlated prompts. Our method leverages the coarse-to-fine nature of diffusion models, where early denoising steps capture shared structures among similar prompts. We propose a training-free approach that clusters prompts based on semantic similarity and shares computation in early diffusion steps. Experiments show that for models trained conditioned on image embeddings, our approach significantly reduces compute cost while improving image quality. By leveraging UnClip’s text-to-image prior, we enhance diffusion step allocation for greater efficiency. Our method seamlessly integrates with existing pipelines, scales with prompt sets, and reduces the environmental and financial burden of large-scale text-to-image generation.
 
-## Install environment
-Note: the packges involving cuda (i.e. PyTorch) must be installed on a GPU.
 
-First create and activate the Conda enviroment
-```
-conda create -n hierarchical-diffusion python=3.12
-conda activate hierarchical-diffusion
-```
 
-Install a PyTorch version compatible with your CUDA version. We use PyTorch 2.6 with CUDA 12.4.
-```
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-```
 
-Install the remaining required packages
-```
-pip install -r requirements.txt
-```
-
-## Run your own example!
-To run the code on your own prompts, pass them in a list after the `--custom_prompts` command line argument.
-```
-python main.py --custom_prompts '["dog", "cat", "horse"]'
-```
-Feel free to also pass any of the fields in `config.py`. For example, to run an experiment called "my_experiment" with a tau value of 1.5, run the following code.
-```
-python main.py --custom_prompts '["dog", "cat", "horse"]' --exp_name my_experiment --tau 1.5
-```
-Any parameter in `config.py` can also be modified directly in that file without explicitly passing it as a command line argument. However, anything passed in the command line will overwrite the corresponding value in `config.py`.
-
-After each run, the generated images are saved in `results/<exp_name>/` as `denoised_images.pt`. For runs with less than `max_batch_size` prompts, we also visualize the generated images as `denoised_images.png` and the corresponding dendrogram as `embedding_dendrogram.png`. If the number of prompts is greater than `max_batch_size`, we only visualize a `max_batch_size`-sized subset of the generated images and do not generate a dendrogram. For each run, we also store the config values used in `config.yml` and the savings relative to standard diffusion in `savings.txt`. See below for a visualization of the file structure.
-```
-...
-├── results/
-│   └── <exp_name>/
-│       ├── config.yml
-│       ├── denoised_images.png
-│       ├── denoised_images.pt
-│       ├── embedding_dendrogram.png
-│       └── savings.txt
-...
-```
-
-## Comparing with standard diffusion inference
-To run standard diffusion, set Tau to $0$ either with the command line argument or in `config.py`.
-```
-python main.py --custom_prompts '["dog", "cat", "horse"]' --exp_name standard_diffusion --tau 0
-```
-Since setting $\tau = 0$ maps all diffusion steps to $c^{score} = 0$ (per eq $7$ from the paper shown below), no computation is shared and our approach becomes identical to standard diffusion inference.
-$\begin{equation}
-    \phi(k) = \tau \cdot \left(1 - \frac{k}{K}\right) \tag{7}
-\end{equation}$
-
-## Reproduce paper results
-To run our method on the datasets we use in the paper (`animals`, `genai_bench`, `prompt_templates`, and `style_variations`), pass the dataset name in the `--prompt_dataset` command line argument or directly set the `prompt_dataset` field in `config.py`. For table $1$, we use the following commands.
-```
-python main.py --prompt_dataset genai_bench --exp_name genai_bench --tau 1.0
-python main.py --prompt_dataset prompt_templates --exp_name prompt_templates --tau 1.0
-python main.py --prompt_dataset style_variations --exp_name style_variations --tau 1.0
-python main.py --prompt_dataset animals --exp_name animals --tau 1.0
-```
-
-## Acknowledgements
-We thank Richard Zhang for insights on evaluation metrics and more generally, the members of Adobe Research and 3DL for their insightful feedback. This work was supported by Adobe Research and NSF grant 2140001.
-
-## Citation
-If you find this code helpful for your research, please cite our paper
-[Reusing Computation in Text-to-Image Diffusion for Efficient Generation of Image Sets](http://arxiv.org/abs/2508.21032).
-```
-@inproceedings{decatur2025reusing,
-  title = {Reusing Computation in Text-to-Image Diffusion for Efficient Generation of Image Sets},
-  author = {Decatur, Dale and Groueix, Thibault and Yifan, Wang and Hanocka, Rana and Kim, Vladimir and Gadelha, Matheus},
-  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision},
-  year = {2025}
-}
