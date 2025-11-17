@@ -1,3 +1,8 @@
+# Reusing Computation in Text-to-Image Diffusion for Efficient Generation of Image Sets
+![teaser](https://github.com/ddecatur/hierarchical-diffusion/raw/site/assets/tree_traversal.png)
+
+
+
 - 1. 遍历每个prompt，调用KandinskyV22PriorPipeline模型得到其有条件的正向嵌入和无条件的负向嵌入，并堆叠起来（[2, prompt数量, 嵌入维度]）
 ```py
 for prompt in tqdm(prompts):
@@ -112,8 +117,10 @@ C_prev = np.ones(num_prompts, dtype=int)
 denoised_images = md.decode_latents(x_k)
 ```
 
-
-
+---
+References:  
+\[[Paper](http://arxiv.org/abs/2508.21032)\]  
+\[[Project Page](https://ddecatur.github.io/hierarchical-diffusion/)\]
 
 
 
